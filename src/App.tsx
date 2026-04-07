@@ -49,10 +49,6 @@ function normalizeFftArray(input: number[]): number[] {
 
 function App() {
   const chartRef = useRef<ChartJS<"line"> | null>(null);
-  const [isListening, setIsListening] = useState(false);
-  const [lastUpdateAt, setLastUpdateAt] = useState<string>("未受信");
-  const [recvCount, setRecvCount] = useState(0);
-  const recvCountRef = useRef(0);
 
   // bin i → 周波数 [Hz]
   const labels = useMemo(
@@ -179,10 +175,6 @@ function App() {
             chart.data.datasets[0].data = normalizeFftArray(payload);
             chart.update("none"); // アニメーションなしで即時描画
           }
-
-          recvCountRef.current += 1;
-          setRecvCount(recvCountRef.current);
-          setLastUpdateAt(new Date().toLocaleTimeString());
         });
 
         if (!mounted) {
@@ -191,7 +183,6 @@ function App() {
         }
 
         unlisten = dispose;
-        setIsListening(true);
         console.log("[fft] listen registered, invoking start_fft_stream");
 
         // 2. listen 完了後に Rust ストリームを開始
@@ -199,7 +190,6 @@ function App() {
         console.log("[fft] start_fft_stream invoked");
       } catch (err) {
         console.error("[fft] setup error:", err);
-        setIsListening(false);
       }
     };
 
@@ -213,7 +203,6 @@ function App() {
       if (unlisten) {
         unlisten();
       }
-      setIsListening(false);
     };
   }, []);
 
@@ -234,13 +223,6 @@ function App() {
       >
         <Line ref={chartRef} data={initialData} options={options} />
       </div>
-
-      <p style={{ textAlign: "center", marginTop: "1rem", opacity: 0.85 }}>
-        受信状態:{" "}
-        <strong>{isListening ? "✅ Listening" : "❌ Not listening"}</strong>
-        {"　"}受信回数: <strong>{recvCount}</strong>
-        {"　"}最終更新: <strong>{lastUpdateAt}</strong>
-      </p>
     </main>
   );
 }

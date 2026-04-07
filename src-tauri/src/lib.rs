@@ -1,19 +1,35 @@
-use std::f32::consts::PI;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::Duration;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::task::AbortHandle;
+use hidapi::HidApi;
 
 const FFT_BIN_COUNT: usize = 1024;
 const FFT_EVENT_NAME: &str = "fft-data";
-const FFT_FRAME_INTERVAL_MS: u64 = 50;
+const VENDOR_ID: u16 = 0x1209;
+const PRODUCT_ID: u16 = 0x0001;
+const REPORT_SIZE: usize = 256;
+const REPORT_HEADER_SIZE: usize = 4;
+const REPORT_DATA_SIZE: usize = REPORT_SIZE - REPORT_HEADER_SIZE;
 
 pub struct StreamState {
-    running: Arc<AtomicBool>,
+    abort_handle: Mutex<Option<AbortHandle>>,
     app: AppHandle,
+}
+
+#[derive(Debug, Clone)]
+struct HidPacket {
+    pub seq: u16,
+    pub offset: u16,
+    pub data: [u8; REPORT_DATA_SIZE],
+}
+impl HidPacket {
+    pub fn new() -> Self {
+        Self {
+            seq: 0,
+            offset: 0,
+            data: [0u8; REPORT_DATA_SIZE],
+        }
+    }
 }
 
 #[tauri::command]
@@ -21,78 +37,94 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-fn clamp_to_u8(v: f32) -> u8 {
-    if v.is_nan() || v <= 0.0 {
-        0
-    } else if v >= 255.0 {
-        255
-    } else {
-        v.round() as u8
-    }
-}
-
-fn generate_sample_fft(frame: u64) -> Vec<u8> {
-    let mut out = vec![0u8; FFT_BIN_COUNT];
-    let t = frame as f32;
-
-    for i in 0..FFT_BIN_COUNT {
-        let x = i as f32;
-
-        let envelope = 180.0 * (-x / 480.0).exp();
-
-        let p1_center = 120.0 + (t * 0.07).sin() * 28.0;
-        let p2_center = 360.0 + (t * 0.05).sin() * 54.0;
-        let p3_center = 740.0 + (t * 0.06).cos() * 42.0;
-
-        let peak1 = 85.0 * (-((x - p1_center) / 18.0).powi(2)).exp();
-        let peak2 = 65.0 * (-((x - p2_center) / 28.0).powi(2)).exp();
-        let peak3 = 48.0 * (-((x - p3_center) / 35.0).powi(2)).exp();
-
-        let ripple = 10.0 * (1.0 + ((x * 0.08) + (t * 0.22) * PI / 2.0).sin());
-        let floor = 3.0 + 2.0 * ((x * 0.013) + t * 0.04).cos();
-
-        let y = envelope * 0.2 + peak1 + peak2 + peak3 + ripple + floor;
-        out[i] = clamp_to_u8(y);
-    }
-
-    out
-}
-
 #[tauri::command]
-fn start_fft_stream(state: State<'_, StreamState>) {
-    let already = state.running.swap(true, Ordering::Relaxed);
-    if already {
+async fn start_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
+    let mut guard = state
+        .abort_handle
+        .lock()
+        .map_err(|e| e.to_string())?;
+
+    if guard.is_some() {
         eprintln!("[fft] stream already running, ignoring start request");
-        return;
+        return Ok(());
     }
 
     let app = state.app.clone();
-    let running = Arc::clone(&state.running);
 
-    eprintln!("[fft] stream started");
+    let join_handle = tokio::task::spawn(async move {
+        eprintln!("[fft] stream started");
 
-    thread::spawn(move || {
-        let mut frame: u64 = 0;
+        // Channel between HID reader and main loop
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<HidPacket>(2);
 
-        while running.load(Ordering::Relaxed) {
-            let fft = generate_sample_fft(frame);
+        // Start HID device
+        let api = HidApi::new().map_err(|e| {
+            eprintln!("[fft] failed to open HID device: {}", e);
+            return;
+        }).unwrap();
 
-            if let Err(err) = app.emit(FFT_EVENT_NAME, fft) {
-                eprintln!("[fft] failed to emit {}: {}", FFT_EVENT_NAME, err);
+        let device = api.open(VENDOR_ID, PRODUCT_ID).map_err(|e| {
+            eprintln!("[fft] failed to open HID device: {}", e);
+            return;
+        }).unwrap();
+
+        tokio::task::spawn(async move {
+            let mut report = [0u8; REPORT_SIZE];
+            let mut packet = HidPacket::new();
+            loop {
+                let n = device.read_timeout(&mut report, 100).map_err(|e| {
+                    eprintln!("[fft] failed to read HID device: {}", e);
+                }).unwrap();
+                if n == 0 || n != REPORT_SIZE {
+                    continue;
+                }
+                packet.seq = u16::from_le_bytes([report[0], report[1]]);
+                packet.offset = u16::from_le_bytes([report[2], report[3]]);
+                packet.data = report[4..].try_into().unwrap();
+
+                if let Err(e) = tx.send(packet.clone()).await {
+                    eprintln!("[fft] failed to send packet: {}", e);
+                }
+            }
+        });
+
+        // Start main loop
+        let mut spectrum = [0u8; FFT_BIN_COUNT];
+        loop {
+            if let Some(packet) = rx.recv().await {
+                let offset_end = (packet.offset as usize + packet.data.len()).min(1023);
+                let source_end = packet.data.len().min(offset_end - packet.offset as usize);
+                println!("offset_end = {}, source_end = {}", offset_end, source_end);
+                spectrum[packet.offset as usize..offset_end]
+                    .copy_from_slice(&packet.data[..source_end]);
             }
 
-            frame = frame.wrapping_add(1);
-            thread::sleep(Duration::from_millis(FFT_FRAME_INTERVAL_MS));
+            if let Err(err) = app.emit(FFT_EVENT_NAME, spectrum.to_vec()) {
+                eprintln!("[fft] failed to emit {}: {}", FFT_EVENT_NAME, err);
+            }
         }
-
-        eprintln!("[fft] stream stopped");
     });
+
+    *guard = Some(join_handle.abort_handle());
+
+    Ok(())
 }
 
 #[tauri::command]
-fn stop_fft_stream(state: State<'_, StreamState>) {
-    state.running.store(false, Ordering::Relaxed);
-    eprintln!("[fft] stop requested");
+async fn stop_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
+    let mut guard = state
+        .abort_handle
+        .lock()
+        .map_err(|e| e.to_string())?;
+
+    if let Some(handle) = guard.take() {
+        handle.abort();
+        eprintln!("[fft] stream stopped");
+    } else {
+        eprintln!("[fft] stop requested but stream was not running");
+    }
+
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -101,7 +133,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(StreamState {
-                running: Arc::new(AtomicBool::new(false)),
+                abort_handle: Mutex::new(None),
                 app: app.handle().clone(),
             });
             Ok(())
@@ -109,11 +141,20 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 if let Some(state) = window.try_state::<StreamState>() {
-                    state.running.store(false, Ordering::Relaxed);
+                    if let Ok(mut guard) = state.abort_handle.lock() {
+                        if let Some(handle) = guard.take() {
+                            handle.abort();
+                            eprintln!("[fft] stream aborted on window close");
+                        }
+                    }
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![greet, start_fft_stream, stop_fft_stream])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            start_fft_stream,
+            stop_fft_stream
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
