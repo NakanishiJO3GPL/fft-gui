@@ -1,35 +1,30 @@
-use std::sync::Mutex;
+use rusb::UsbContext as _;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::task::AbortHandle;
-use hidapi::HidApi;
+
+// ── USB 設定 ─────────────────────────────────
+// デバイスの VID / PID / エンドポイントに合わせて変更してください
+const USB_VENDOR_ID: u16 = 0x1209;
+const USB_PRODUCT_ID: u16 = 0x0001;
+const USB_INTERFACE: u8 = 0;
+const USB_BULK_IN_EP: u8 = 0x81; // Bulk IN エンドポイントアドレス
+const USB_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const USB_SEQ_SIZE: usize = 2;                          // シーケンス番号のバイト数
+const USB_EXPECTED_SIZE: usize = USB_SEQ_SIZE + FFT_BIN_COUNT; // 期待する最小サイズ (1026)
+const USB_BULK_BUFFER_SIZE: usize = 4096;               // Overflow 防止のため余裕を持たせる
 
 const FFT_BIN_COUNT: usize = 1024;
 const FFT_EVENT_NAME: &str = "fft-data";
-const VENDOR_ID: u16 = 0x1209;
-const PRODUCT_ID: u16 = 0x0001;
-const REPORT_SIZE: usize = 256;
-const REPORT_HEADER_SIZE: usize = 4;
-const REPORT_DATA_SIZE: usize = REPORT_SIZE - REPORT_HEADER_SIZE;
 
 pub struct StreamState {
     abort_handle: Mutex<Option<AbortHandle>>,
+    running: Arc<AtomicBool>,
     app: AppHandle,
-}
-
-#[derive(Debug, Clone)]
-struct HidPacket {
-    pub seq: u16,
-    pub offset: u16,
-    pub data: [u8; REPORT_DATA_SIZE],
-}
-impl HidPacket {
-    pub fn new() -> Self {
-        Self {
-            seq: 0,
-            offset: 0,
-            data: [0u8; REPORT_DATA_SIZE],
-        }
-    }
 }
 
 #[tauri::command]
@@ -50,59 +45,79 @@ async fn start_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
     }
 
     let app = state.app.clone();
+    let running = Arc::clone(&state.running);
+    running.store(true, Ordering::Relaxed);
 
-    let join_handle = tokio::task::spawn(async move {
-        eprintln!("[fft] stream started");
-
-        // Channel between HID reader and main loop
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<HidPacket>(2);
-
-        // Start HID device
-        let api = HidApi::new().map_err(|e| {
-            eprintln!("[fft] failed to open HID device: {}", e);
-            return;
-        }).unwrap();
-
-        let device = api.open(VENDOR_ID, PRODUCT_ID).map_err(|e| {
-            eprintln!("[fft] failed to open HID device: {}", e);
-            return;
-        }).unwrap();
-
-        tokio::task::spawn(async move {
-            let mut report = [0u8; REPORT_SIZE];
-            let mut packet = HidPacket::new();
-            loop {
-                let n = device.read_timeout(&mut report, 100).map_err(|e| {
-                    eprintln!("[fft] failed to read HID device: {}", e);
-                }).unwrap();
-                if n == 0 || n != REPORT_SIZE {
-                    continue;
-                }
-                packet.seq = u16::from_le_bytes([report[0], report[1]]);
-                packet.offset = u16::from_le_bytes([report[2], report[3]]);
-                packet.data = report[4..].try_into().unwrap();
-
-                if let Err(e) = tx.send(packet.clone()).await {
-                    eprintln!("[fft] failed to send packet: {}", e);
-                }
+    // rusb は同期 API なので spawn_blocking でラップする
+    let join_handle = tokio::task::spawn_blocking(move || {
+        // USB コンテキスト生成
+        let context = match rusb::Context::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[fft] USB context error: {}", e);
+                running.store(false, Ordering::Relaxed);
+                return;
             }
-        });
+        };
 
-        // Start main loop
-        let mut spectrum = [0u8; FFT_BIN_COUNT];
-        loop {
-            if let Some(packet) = rx.recv().await {
-                let offset_end = (packet.offset as usize + packet.data.len()).min(1023);
-                let source_end = packet.data.len().min(offset_end - packet.offset as usize);
-                println!("offset_end = {}, source_end = {}", offset_end, source_end);
-                spectrum[packet.offset as usize..offset_end]
-                    .copy_from_slice(&packet.data[..source_end]);
+        // デバイスをオープン
+        let handle: rusb::DeviceHandle<rusb::Context> = match context.open_device_with_vid_pid(USB_VENDOR_ID, USB_PRODUCT_ID) {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "[fft] USB device {:04x}:{:04x} not found",
+                    USB_VENDOR_ID, USB_PRODUCT_ID
+                );
+                running.store(false, Ordering::Relaxed);
+                return;
             }
+        };
 
-            if let Err(err) = app.emit(FFT_EVENT_NAME, spectrum.to_vec()) {
-                eprintln!("[fft] failed to emit {}: {}", FFT_EVENT_NAME, err);
+        // インターフェースをクレーム
+        if let Err(e) = handle.claim_interface(USB_INTERFACE) {
+            eprintln!("[fft] claim_interface({}) failed: {}", USB_INTERFACE, e);
+            running.store(false, Ordering::Relaxed);
+            return;
+        }
+
+        eprintln!(
+            "[fft] USB {:04x}:{:04x} opened, bulk stream started",
+            USB_VENDOR_ID, USB_PRODUCT_ID
+        );
+
+        // Seq(2byte) + FFTデータ(1024byte) = 1026byte を1回で受け取る
+        // バッファは余裕を持たせて Overflow を防ぐ
+        let mut buf = vec![0u8; USB_BULK_BUFFER_SIZE];
+
+        while running.load(Ordering::Relaxed) {
+            match handle.read_bulk(USB_BULK_IN_EP, &mut buf, USB_READ_TIMEOUT) {
+                Ok(n) if n >= USB_EXPECTED_SIZE => {
+                    let fft_data = buf[USB_SEQ_SIZE..USB_EXPECTED_SIZE].to_vec();
+                    if let Err(e) = app.emit(FFT_EVENT_NAME, fft_data) {
+                        eprintln!("[fft] emit error: {}", e);
+                    }
+                }
+                Ok(0) => {
+                    // Zero Length Packet (ZLP) は転送終端の通知として正常。無視する
+                }
+                Ok(n) => {
+                    eprintln!(
+                        "[fft] unexpected packet size: {} bytes (expected >= {})",
+                        n, USB_EXPECTED_SIZE
+                    );
+                }
+                Err(rusb::Error::Timeout) => {
+                    // 短いタイムアウトで running フラグを確認するための正常ケース
+                }
+                Err(e) => {
+                    eprintln!("[fft] USB read error: {}", e);
+                    break;
+                }
             }
         }
+
+        eprintln!("[fft] bulk stream stopped");
+        running.store(false, Ordering::Relaxed);
     });
 
     *guard = Some(join_handle.abort_handle());
@@ -112,6 +127,9 @@ async fn start_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn stop_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
+    // running フラグを先に落とす（ブロッキングループを抜けさせる）
+    state.running.store(false, Ordering::Relaxed);
+
     let mut guard = state
         .abort_handle
         .lock()
@@ -119,7 +137,7 @@ async fn stop_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
 
     if let Some(handle) = guard.take() {
         handle.abort();
-        eprintln!("[fft] stream stopped");
+        eprintln!("[fft] stop requested");
     } else {
         eprintln!("[fft] stop requested but stream was not running");
     }
@@ -134,6 +152,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(StreamState {
                 abort_handle: Mutex::new(None),
+                running: Arc::new(AtomicBool::new(false)),
                 app: app.handle().clone(),
             });
             Ok(())
@@ -141,6 +160,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 if let Some(state) = window.try_state::<StreamState>() {
+                    state.running.store(false, Ordering::Relaxed);
                     if let Ok(mut guard) = state.abort_handle.lock() {
                         if let Some(handle) = guard.take() {
                             handle.abort();
