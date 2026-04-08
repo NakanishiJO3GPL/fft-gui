@@ -135,7 +135,7 @@ function App() {
         },
         y: {
           min: FFT_MIN,
-          max: FFT_MAX,
+          max: FFT_MAX + 1,
           title: {
             display: true,
             text: "Amplitude (0-255)",
