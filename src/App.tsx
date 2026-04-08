@@ -53,6 +53,12 @@ function App() {
   const avgDataRef = useRef<number[]>(new Array<number>(FFT_BIN_COUNT).fill(0));
   const [showAvg, setShowAvg] = useState(false);
   const showAvgRef = useRef(false);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+
+  useEffect(() => {
+    pausedRef.current = paused;
+  }, [paused]);
 
   useEffect(() => {
     showAvgRef.current = showAvg;
@@ -191,6 +197,7 @@ function App() {
         // 1. listen を登録
         const dispose = await listen<number[]>(FFT_EVENT_NAME, (event) => {
           if (!mounted) return;
+          if (pausedRef.current) return;
 
           const payload = Array.isArray(event.payload) ? event.payload : [];
 
@@ -251,6 +258,12 @@ function App() {
             <option value="off">OFF</option>
             <option value="on">ON</option>
           </select>
+          <button
+            className="toolbar-pause-btn"
+            onClick={() => setPaused((p) => !p)}
+          >
+            {paused ? "▶ 再開" : "⏸ 一時停止"}
+          </button>
         </div>
         <div className="chart-panel">
           <Line ref={chartRef} data={initialData} options={options} />
