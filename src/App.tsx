@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -32,6 +32,7 @@ const FFT_MAX = 255;
 const FFT_EVENT_NAME = "fft-data";
 const SAMPLE_RATE = 48000;
 const HZ_PER_BIN = SAMPLE_RATE / 2 / FFT_BIN_COUNT; // 23.4375 Hz/bin (Nyquist = 24kHz)
+const AVG_ALPHA = 0.05; // EMA smoothing factor (smaller = slower/smoother average)
 
 function clampTo8bit(value: number): number {
   if (Number.isNaN(value)) return 0;
@@ -49,6 +50,19 @@ function normalizeFftArray(input: number[]): number[] {
 
 function App() {
   const chartRef = useRef<ChartJS<"line"> | null>(null);
+  const avgDataRef = useRef<number[]>(new Array<number>(FFT_BIN_COUNT).fill(0));
+  const [showAvg, setShowAvg] = useState(false);
+  const showAvgRef = useRef(false);
+
+  useEffect(() => {
+    showAvgRef.current = showAvg;
+    const chart = chartRef.current;
+    if (chart) {
+      chart.data.datasets[0].hidden = showAvg;
+      chart.data.datasets[1].hidden = !showAvg;
+      chart.update("none");
+    }
+  }, [showAvg]);
 
   // bin i → 周波数 [Hz]
   const labels = useMemo(
@@ -73,6 +87,17 @@ function App() {
           pointRadius: 0,
           tension: 0,
           fill: true,
+        },
+        {
+          label: "Average (EMA)",
+          data: new Array<number>(FFT_BIN_COUNT).fill(0),
+          borderColor: "#f59e0b",
+          backgroundColor: "transparent",
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0,
+          fill: false,
+          hidden: true,
         },
       ],
     }),
@@ -172,7 +197,14 @@ function App() {
           // chartRef 経由で直接 Chart.js インスタンスを更新
           const chart = chartRef.current;
           if (chart) {
-            chart.data.datasets[0].data = normalizeFftArray(payload);
+            const newData = normalizeFftArray(payload);
+            const avg = avgDataRef.current;
+            const avgDs = chart.data.datasets[1].data as number[];
+            for (let i = 0; i < FFT_BIN_COUNT; i++) {
+              avg[i] = AVG_ALPHA * newData[i] + (1 - AVG_ALPHA) * avg[i];
+              avgDs[i] = Math.round(avg[i]);
+            }
+            chart.data.datasets[0].data = newData;
             chart.update("none"); // アニメーションなしで即時描画
           }
         });
@@ -208,20 +240,21 @@ function App() {
 
   return (
     <main className="container">
-      <h1>FFT GUI - 1024bin Line Chart</h1>
-
-      <div
-        style={{
-          width: "min(1100px, 96vw)",
-          height: "460px",
-          margin: "0 auto",
-          padding: "1rem",
-          borderRadius: "12px",
-          background: "rgba(255, 255, 255, 0.78)",
-          boxShadow: "0 6px 20px rgba(0, 0, 0, 0.08)",
-        }}
-      >
-        <Line ref={chartRef} data={initialData} options={options} />
+      <div className="chart-wrapper">
+        <div className="toolbar">
+          <label htmlFor="avg-select">平均表示 (EMA)</label>
+          <select
+            id="avg-select"
+            value={showAvg ? "on" : "off"}
+            onChange={(e) => setShowAvg(e.target.value === "on")}
+          >
+            <option value="off">OFF</option>
+            <option value="on">ON</option>
+          </select>
+        </div>
+        <div className="chart-panel">
+          <Line ref={chartRef} data={initialData} options={options} />
+        </div>
       </div>
     </main>
   );
