@@ -4,6 +4,8 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
+use std::io::{BufWriter, Write as _};
+use std::fs::File;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::task::AbortHandle;
 
@@ -49,13 +51,15 @@ async fn save_ema_csv(ema_data: Vec<f64>) -> Result<String, String> {
         return Ok("cancelled".to_string());
     };
 
-    let mut content = String::from("frequency_hz,amplitude\n");
+    let file = File::create(&path).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(b"frequency_hz,amplitude\n").map_err(|e| e.to_string())?;
     for (i, val) in ema_data.iter().enumerate() {
         let hz = i as f64 * HZ_PER_BIN;
-        content.push_str(&format!("{:.4},{}\n", hz, val.round() as i32));
+        writeln!(writer, "{:.4},{}", hz, val.round() as i32).map_err(|e| e.to_string())?;
     }
+    writer.flush().map_err(|e| e.to_string())?;
 
-    std::fs::write(&path, content).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
 
