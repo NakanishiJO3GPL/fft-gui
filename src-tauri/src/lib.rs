@@ -32,6 +32,33 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+const HZ_PER_BIN: f64 = 48000.0 / 2.0 / FFT_BIN_COUNT as f64;
+
+#[tauri::command]
+async fn save_ema_csv(ema_data: Vec<f64>) -> Result<String, String> {
+    let path = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_file_name("ema.csv")
+            .add_filter("CSV", &["csv"])
+            .save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let Some(path) = path else {
+        return Ok("cancelled".to_string());
+    };
+
+    let mut content = String::from("frequency_hz,amplitude\n");
+    for (i, val) in ema_data.iter().enumerate() {
+        let hz = i as f64 * HZ_PER_BIN;
+        content.push_str(&format!("{:.4},{}\n", hz, val.round() as i32));
+    }
+
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 async fn start_fft_stream(state: State<'_, StreamState>) -> Result<(), String> {
     let mut guard = state
@@ -173,7 +200,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             start_fft_stream,
-            stop_fft_stream
+            stop_fft_stream,
+            save_ema_csv
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

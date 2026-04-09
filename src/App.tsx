@@ -264,6 +264,23 @@ function App() {
           >
             {paused ? "▶ 再開" : "⏸ 一時停止"}
           </button>
+          <button
+            className="toolbar-pause-btn"
+            onClick={async () => {
+              try {
+                const result = await invoke<string>("save_ema_csv", {
+                  emaData: avgDataRef.current,
+                });
+                if (result !== "cancelled") {
+                  console.log("[csv] saved to:", result);
+                }
+              } catch (e) {
+                console.error("[csv] save error:", e);
+              }
+            }}
+          >
+            💾 EMAをCSV保存
+          </button>
         </div>
         <div className="chart-panel">
           <Line ref={chartRef} data={initialData} options={options} />

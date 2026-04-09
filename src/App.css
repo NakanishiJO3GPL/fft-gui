@@ -76,6 +76,10 @@
   background: #ffffff;
   color: #374151;
   cursor: pointer;
+  width: 10rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chart-panel {
